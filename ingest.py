@@ -12,8 +12,9 @@ from typing import Dict, List, Optional
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col, current_timestamp, lit, udf, to_date, to_timestamp, when, lower,
-    coalesce, length, regexp_replace, year, max as spark_max, trim
+    coalesce, length, regexp_replace, year, trim, concat_ws
 )
+import hashlib
 from pyspark.sql.types import (
     BooleanType, DateType, DecimalType, DoubleType, StringType,
     StructField, StructType, TimestampType
@@ -75,6 +76,13 @@ def validate_json_udf(val: str) -> Optional[str]:
         return val
     except Exception:
         return None
+
+
+@udf(StringType())
+def sha3_512_udf(val: str) -> Optional[str]:
+    if val is None:
+        return None
+    return hashlib.sha3_512(val.encode("utf-8")).hexdigest()
 
 # -----------------------------------------------------------------------------
 # ConfigManager
@@ -647,6 +655,11 @@ def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
         df = df.withColumn(col_name, lit(None).cast(target_schema[col_name].dataType))
     return df
 
+def add_hash_key(df: DataFrame, metadata_cols: List[str], key_col: str) -> DataFrame:
+    non_meta_cols = [c for c in df.columns if c not in metadata_cols and c != key_col]
+    concatenated = concat_ws("||", *[col(c).cast("string") for c in non_meta_cols])
+    return df.withColumn(key_col, sha3_512_udf(concatenated))
+
 def transform_columns(df: DataFrame, target_schema: StructType, table_name: str) -> DataFrame:
     df = clean_invalid_timestamps(df)
     for field in target_schema.fields:
@@ -685,27 +698,6 @@ class TableProcessor:
                 .option("inferSchema", "false")
                 .load(raw_dataset_path)
             )
-
-    def get_etl_last_update_date(self) -> Optional[str]:
-        spark = self.config.get_spark()
-        path = f"{self.config.METADATA_BASE_PATH}/etl_last_update_{self.table_name}.txt"
-        try:
-            df = spark.read.text(path)
-            watermark = df.first()[0].strip()
-            logger.info(f"Read watermark for {self.table_name}: {watermark}") # <<<
-            return watermark
-        except Exception as ex:
-            logger.info(f"No watermark found for {self.table_name}: {ex}") # <<<
-            return None
-
-    def update_etl_last_update_date(self, new_value: str) -> None:
-        spark = self.config.get_spark()
-        path = f"{self.config.METADATA_BASE_PATH}/etl_last_update_{self.table_name}.txt"
-        try:
-            spark.createDataFrame([(new_value,)], ["watermark"]).coalesce(1).write.mode("overwrite").text(path)
-            logger.info(f"Watermark for {self.table_name} updated to {new_value}") # <<<
-        except Exception as ex:
-            logger.error(f"Could not update watermark for {self.table_name}: {ex}")
 
     def snowflake_table_exists(self) -> bool:
         spark = self.config.get_spark()
@@ -757,6 +749,20 @@ class TableProcessor:
                     when(col("METADATA").isNull(), lit(None)).otherwise(col("METADATA").cast(StringType()))
                 )
                 logger.info("Applied lead assignment specific handling")
+            metadata_cols = [
+                "ETL_CREATED_DATE",
+                "ETL_LAST_UPDATE_DATE",
+                "CREATED_BY",
+                "TO_PROCESS",
+                "EDW_EXTERNAL_SOURCE_SYSTEM",
+            ]
+            key_col_mapping = {
+                "lead": "STG_LCR_LEAD_KEY",
+                "lead_assignment": "STG_LCR_LEAD_ASSIGNMENT_KEY",
+                "lead_xref": "STG_LCR_LEAD_XREF_KEY",
+            }
+            key_col = key_col_mapping[self.table_name]
+            raw_df = add_hash_key(raw_df, metadata_cols + [key_col], key_col)
             raw_df = add_metadata_columns(raw_df, target_schema)
             target_columns = [field.name for field in target_schema.fields]
             raw_df = raw_df.select(*target_columns)
@@ -811,34 +817,21 @@ class TableProcessor:
                         time.sleep(5)
                 logger.info(f"Successfully wrote to Snowflake for table {self.table_name}")
                 self.create_checkpoint()
-                if self.historical_load and "ETL_LAST_UPDATE_DATE" in raw_df.columns:
-                    max_val = raw_df.agg(spark_max(col("ETL_LAST_UPDATE_DATE"))).collect()[0][0]
-                    if max_val:
-                        self.update_etl_last_update_date(str(max_val))
             elif self.write_mode == "incremental_insert":
-                watermark = self.get_etl_last_update_date()
-                if watermark and not self.historical_load:
-                    logger.info(f"Using watermark for {self.table_name}: {watermark}") # <<<
-                    raw_df_filtered = raw_df.filter(
-                        col("ETL_LAST_UPDATE_DATE") > to_timestamp(lit(watermark))
-                    )
-                else:
-                    # If watermark is missing, we must TRUNCATE and load all data (avoid dupes).
-                    logger.info(
-                        f"No watermark for {self.table_name} or historical load, truncating and loading all data."
-                    ) # <<<
-                    truncate_options = {
-                        **sf_config_stg,
-                        "dbtable": f"STG_LCR_{self.table_name.upper()}",
-                        "truncate_table": "on"
-                    }
-                    spark.createDataFrame([], target_schema) \
-                        .write.format("net.snowflake.spark.snowflake") \
-                        .options(**truncate_options) \
-                        .mode("overwrite") \
-                        .save()
-                    logger.info(f"Table STG_LCR_{self.table_name.upper()} truncated (no watermark on incremental)") # <<<
-                    raw_df_filtered = raw_df
+                target = spark.read.format("net.snowflake.spark.snowflake").options(**sf_config_stg).option(
+                    "dbtable", f"STG_LCR_{self.table_name.upper()}"
+                ).load()
+                key_col_mapping = {
+                    "lead": "STG_LCR_LEAD_KEY",
+                    "lead_assignment": "STG_LCR_LEAD_ASSIGNMENT_KEY",
+                    "lead_xref": "STG_LCR_LEAD_XREF_KEY",
+                }
+                key_col = key_col_mapping[self.table_name]
+                raw_df_filtered = raw_df.join(
+                    target.select(key_col),
+                    on=key_col,
+                    how="left_anti",
+                )
 
                 validate_dataframe(raw_df_filtered, target_schema)
                 write_options = {
@@ -857,10 +850,6 @@ class TableProcessor:
                             raise
                         logger.warning(f"Snowflake write failed, retrying... {w_err}")
                         time.sleep(5)
-                if "ETL_LAST_UPDATE_DATE" in raw_df_filtered.columns:
-                    max_val = raw_df_filtered.agg(spark_max(col("ETL_LAST_UPDATE_DATE"))).collect()[0][0]
-                    if max_val:
-                        self.update_etl_last_update_date(str(max_val))
                 logger.info(f"Appended records to table STG_LCR_{self.table_name.upper()}")
                 self.create_checkpoint()
             else:
@@ -880,8 +869,8 @@ class ETLPipeline:
         self.schema = schema
 
     def run(self):
-        write_mode = "append"
-        historical_load = True
+        write_mode = "incremental_insert"
+        historical_load = False
         for table in self.config.TABLES:
             if self.config.TABLE_PROCESSING_CONFIG.get(table, False):
                 processor = TableProcessor(table, write_mode, historical_load, self.config, self.schema)
