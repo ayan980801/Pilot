@@ -3,9 +3,8 @@ import logging
 import time
 import traceback
 import re
-from typing import Dict
 import psycopg2
-from psycopg2 import pool, OperationalError, sql
+from psycopg2 import OperationalError, sql
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
 
@@ -14,7 +13,7 @@ class Config:
     @staticmethod
     def _get_secret(scope: str, key: str) -> str:
         try:
-            from pyspark.dbutils import DBUtils
+            from pyspark.dbutils import DBUtils  # type: ignore
 
             dbutils = DBUtils(SparkSession.builder.getOrCreate())
             return dbutils.secrets.get(scope=scope, key=key)
@@ -56,7 +55,7 @@ class DBUtilsCompat:
     @staticmethod
     def get_dbutils():
         try:
-            from pyspark.dbutils import DBUtils
+            from pyspark.dbutils import DBUtils  # type: ignore
 
             dbutils = DBUtils(SparkSession.builder.getOrCreate())
             return dbutils
@@ -120,9 +119,11 @@ class PostgresDataHandler:
         return bool(re.fullmatch(r"[\w\.\"]+", table))
 
     @staticmethod
-    def _parse_table(table: str) -> (str, str):
+    def _parse_table(table: str) -> tuple[str, str]:
+        from typing import cast
+
         t = table.replace('"', "")
-        return t.split(".", 1) if "." in t else ("public", t)
+        return cast(tuple[str, str], tuple(t.split(".", 1))) if "." in t else ("public", t)
 
     def table_count(self, table: str) -> int:
         if not self._valid_table(table):
