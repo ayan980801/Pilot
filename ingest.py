@@ -102,7 +102,7 @@ class ConfigManager:
     @classmethod
     def get_secret(cls, scope: str, key: str) -> str:
         try:
-            from pyspark.dbutils import DBUtils
+            from pyspark.dbutils import DBUtils  # type: ignore
             dbutils = DBUtils(cls.get_spark())
             return dbutils.secrets.get(scope=scope, key=key)
         except Exception:
